@@ -408,6 +408,9 @@ def Qwen3VLModel_forward(
                     .sort()
                     .values
                 )
+                flashvid_config.prefill_keep_indices = keep_global_indexes.detach()
+                flashvid_config.prefill_original_seq_len = int(input_ids.shape[-1])
+                flashvid_config.prefill_compressed_seq_len = int(keep_global_indexes.numel())
 
                 hidden_size = inputs_embeds.size(-1)
                 compressed_visual_tokens = compressed_visual_tokens.view(-1, hidden_size)
