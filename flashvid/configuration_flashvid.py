@@ -28,6 +28,9 @@ class FlashVidConfig:
     # Inner-LLM Compression params.
     visual_token_start_index: Optional[int] = field(default=None)
     visual_token_length: Optional[int] = field(default=None)
+    original_visual_token_length: Optional[int] = field(default=None)
+    vision_side_visual_token_length: Optional[int] = field(default=None)
+    compression_source: Optional[str] = field(default=None)
     expansion: float = field(default=1.25)
     pruning_layer: int = field(default=20)
     llm_retention_ratio: float = field(default=0.3)

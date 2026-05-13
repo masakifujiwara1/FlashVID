@@ -138,7 +138,7 @@ def segment_compression(
     all_tokens = [selected_features.view(-1, feat_dim)]
     all_global_indices = [selected_global_indices]
     # 2. Apply Spatial Merging to the tokens after temporal merging.
-    if num_other_tokens > 0: ## Only apply spatial merging when there are STTM tokens.
+    if num_other_tokens > 0 and len(temp_merged_token_list) > 0:
         # Calculate adaptive contextual ratio.
         num_current_retained_tokens = sum(len(tokens) for tokens in temp_merged_token_list)
         adapative_contextual_ratio = num_other_tokens / num_current_retained_tokens

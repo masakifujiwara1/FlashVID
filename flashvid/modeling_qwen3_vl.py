@@ -74,22 +74,21 @@ def Qwen3VLVisionAttention_forward(
     attn_weights = None
     if return_logits:
         # Calculate attention weights manually, frame by frame to save memory.
-        num_frames = cu_seqlens.shape[0] - 1
         q, k = query_states.squeeze(0), key_states.squeeze(0)
         q = q.transpose(0, 1)
         k = k.transpose(0, 1)
-        q = q.reshape(num_frames, -1, self.num_heads, self.head_dim).permute(0, 2, 1, 3).contiguous()
-        k = k.reshape(num_frames, -1, self.num_heads, self.head_dim).permute(0, 2, 1, 3).contiguous()
-        
+        frame_lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
         attn_weights_list = []
-        for i in range(num_frames):
-            qi = q[i] # (num_heads, seq_len_per_frame, head_dim)
-            ki = k[i] # (num_heads, seq_len_per_frame, head_dim)
+        for start, end in zip(cu_seqlens[:-1].tolist(), cu_seqlens[1:].tolist()):
+            qi = q[start:end].permute(1, 0, 2).contiguous() # (num_heads, seq_len_per_frame, head_dim)
+            ki = k[start:end].permute(1, 0, 2).contiguous() # (num_heads, seq_len_per_frame, head_dim)
             attn_i = torch.matmul(qi, ki.transpose(-1, -2)) / self.head_dim**0.5
             attn_i = nn.functional.softmax(attn_i, dim=-1, dtype=torch.float32).to(qi.dtype)
             attn_i = attn_i.mean(0).mean(0) # (seq_len_per_frame,)
             attn_weights_list.append(attn_i)
-        attn_weights = torch.stack(attn_weights_list, dim=0) # (num_frames, seq_len_per_frame)
+
+        if len(set(frame_lengths)) == 1:
+            attn_weights = torch.stack(attn_weights_list, dim=0) # (num_frames, seq_len_per_frame)
         
     attn_output = attn_output.reshape(seq_length, -1).contiguous()
     attn_output = self.proj(attn_output)
@@ -178,10 +177,15 @@ def Qwen3VLVisionModel_forward(
 
     hidden_states = self.merger(hidden_states)
 
-    # Process attn_weights
-    num_frames = grid_thw[0][0].item()
-    seq_len = attn_weights.shape[-1] // 4
-    attn_weights = attn_weights.view(num_frames, seq_len, -1).mean(-1)
+    # Process attention weights after spatial merge. Image inputs arrive as
+    # multiple grid rows with t=1, while video inputs usually use one row with
+    # t=num_frames, so use the total temporal count for both routes.
+    if attn_weights is not None:
+        num_frames = int(grid_thw[:, 0].sum().item())
+        spatial_merge_size = getattr(self, "spatial_merge_size", 2)
+        spatial_merge_unit = getattr(self, "spatial_merge_unit", spatial_merge_size**2)
+        seq_len = attn_weights.shape[-1] // spatial_merge_unit
+        attn_weights = attn_weights.view(num_frames, seq_len, spatial_merge_unit).mean(-1)
 
     return hidden_states, deepstack_feature_lists, attn_weights
 
@@ -214,18 +218,30 @@ def Qwen3VLModel_forward(
 
     image_mask = None
     video_mask = None
+    image_cls_attention = None
+    video_cls_attention = None
+    n_image_tokens = None
+    n_video_tokens = None
 
     if pixel_values is not None:
-        image_embeds, deepstack_image_embeds = self.get_image_features(pixel_values, image_grid_thw)
+        # Alpamayo passes temporal camera frames through the image route. Keep
+        # the final-layer visual attentions so FlashVID can treat those images
+        # as a pseudo-video below.
+        image_embeds, deepstack_image_embeds, image_cls_attention = self.get_image_features(
+            pixel_values, image_grid_thw
+        )
         image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
         image_mask, _ = self.get_placeholder_mask(
             input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
         )
+        n_image_tokens = image_embeds.shape[0]
         inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 
     if pixel_values_videos is not None:
         # ! Obtain [CLS] attentions for FlashVID compression.
-        video_embeds, deepstack_video_embeds, cls_attention = self.get_video_features(pixel_values_videos, video_grid_thw)
+        video_embeds, deepstack_video_embeds, video_cls_attention = self.get_video_features(
+            pixel_values_videos, video_grid_thw
+        )
         video_embeds = torch.cat(video_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
         _, video_mask = self.get_placeholder_mask(
             input_ids, inputs_embeds=inputs_embeds, video_features=video_embeds
@@ -303,52 +319,123 @@ def Qwen3VLModel_forward(
             position_ids = position_ids.add(delta)
             position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
 
-    ### ! Applies FlashVid compression here.
-    if position_ids.shape[-1] > 1:
-        num_frames, num_visual_tokens = cls_attention.shape
+    ### ! Applies FlashVID compression here.
+    if position_ids.shape[-1] > 1 and visual_pos_masks is not None:
         flashvid_config: FlashVidConfig = getattr(self, "flashvid_config")
-        # Store feature map resolution.
-        flashvid_config.H = video_grid_thw[0][1].item() // 2
-        flashvid_config.W = video_grid_thw[0][2].item() // 2
-        video_features = video_embeds.view(num_frames, num_visual_tokens, -1)
-        compressed_video_tokens, keep_visual_global_indices = flashvid_compression(
-            video_features=video_features,
-            cls_attention=cls_attention,
-            flashvid_config=flashvid_config,
-        )
+        compression_source = None
+        visual_embeds = None
+        cls_attention = None
+        visual_grid_thw = None
+        visual_token_id = None
+        n_visual_tokens = None
 
-        non_visual_token_indexes = torch.where(
-            (input_ids[0] != self.config.vision_start_token_id)
-            & (input_ids[0] != self.config.vision_end_token_id)
-            & (input_ids[0] != self.config.video_token_id))[0]
-        visual_token_indexes = torch.where(input_ids[0] == self.config.video_token_id)[0]
-        visual_start_index = visual_token_indexes[0].item()
-        visual_length = n_video_tokens
-        # Update FlashVid config.
-        flashvid_config.visual_token_start_index = visual_start_index
-        flashvid_config.visual_token_length = compressed_video_tokens.shape[0] # ! NOTE
-        # ! Filter deepstack_visual_embeds
-        deepstack_visual_embeds = [deepstack_visual_embed[keep_visual_global_indices] for deepstack_visual_embed in deepstack_visual_embeds]
-        keep_global_indexes = (
-            torch.cat(
-                [
-                    visual_token_indexes[keep_visual_global_indices],
-                    non_visual_token_indexes,
-                ],
-                dim=0,
+        # Alpamayo provides temporal camera frames as multiple images. Compress
+        # image-only inputs by treating the image sequence as a pseudo-video.
+        # Keep the original video route unchanged for regular video inputs.
+        if image_mask is not None and video_mask is None:
+            compression_source = "image"
+            visual_embeds = image_embeds
+            cls_attention = image_cls_attention
+            visual_grid_thw = image_grid_thw
+            visual_token_id = self.config.image_token_id
+            n_visual_tokens = n_image_tokens
+        elif video_mask is not None and image_mask is None:
+            compression_source = "video"
+            visual_embeds = video_embeds
+            cls_attention = video_cls_attention
+            visual_grid_thw = video_grid_thw
+            visual_token_id = self.config.video_token_id
+            n_visual_tokens = n_video_tokens
+
+        if compression_source is None:
+            visual_token_indexes = torch.where(visual_pos_masks[0])[0]
+            if visual_token_indexes.numel() > 0:
+                flashvid_config.compression_source = "mixed"
+                flashvid_config.visual_token_start_index = visual_token_indexes[0].item()
+                flashvid_config.original_visual_token_length = int(visual_token_indexes.numel())
+                flashvid_config.vision_side_visual_token_length = int(visual_token_indexes.numel())
+                flashvid_config.visual_token_length = int(visual_token_indexes.numel())
+
+        if compression_source is not None:
+            visual_token_indexes = torch.where(input_ids[0] == visual_token_id)[0]
+            if visual_token_indexes.numel() > 0:
+                flashvid_config.compression_source = compression_source
+                flashvid_config.visual_token_start_index = visual_token_indexes[0].item()
+                flashvid_config.original_visual_token_length = int(n_visual_tokens)
+                flashvid_config.vision_side_visual_token_length = int(n_visual_tokens)
+                flashvid_config.visual_token_length = int(n_visual_tokens)
+
+            can_compress = (
+                cls_attention is not None
+                and visual_embeds is not None
+                and visual_token_indexes.numel() > 0
             )
-            .sort()
-            .values
-        )
+            if can_compress:
+                num_frames, num_visual_tokens = cls_attention.shape
+                can_compress = visual_embeds.shape[0] == num_frames * num_visual_tokens
 
-        hidden_size = inputs_embeds.size(-1)
-        assert visual_token_indexes[keep_visual_global_indices].shape[0] == compressed_video_tokens.view(-1, hidden_size).shape[0]
-        inputs_embeds[:, visual_token_indexes[keep_visual_global_indices]] = compressed_video_tokens.view(-1, hidden_size).unsqueeze(0)
-        inputs_embeds = inputs_embeds[:, keep_global_indexes]
-        position_ids = position_ids[:, :, keep_global_indexes]
-        attention_mask = attention_mask[:, keep_global_indexes]
-        cache_position = cache_position[keep_global_indexes]
-        visual_pos_masks = visual_pos_masks[:, keep_global_indexes]
+            if can_compress:
+                spatial_merge_size = getattr(self.visual, "spatial_merge_size", 2)
+                flashvid_config.H = visual_grid_thw[0][1].item() // spatial_merge_size
+                flashvid_config.W = visual_grid_thw[0][2].item() // spatial_merge_size
+                visual_features = visual_embeds.view(num_frames, num_visual_tokens, -1)
+                compressed_visual_tokens, keep_visual_global_indices = flashvid_compression(
+                    video_features=visual_features,
+                    cls_attention=cls_attention,
+                    flashvid_config=flashvid_config,
+                )
+
+                non_visual_token_indexes = torch.where(
+                    (input_ids[0] != self.config.vision_start_token_id)
+                    & (input_ids[0] != self.config.vision_end_token_id)
+                    & (input_ids[0] != visual_token_id)
+                )[0]
+                flashvid_config.vision_side_visual_token_length = compressed_visual_tokens.shape[0]
+                flashvid_config.visual_token_length = compressed_visual_tokens.shape[0]
+                # ! Filter deepstack_visual_embeds
+                deepstack_visual_embeds = [
+                    deepstack_visual_embed[keep_visual_global_indices]
+                    for deepstack_visual_embed in deepstack_visual_embeds
+                ]
+                keep_global_indexes = (
+                    torch.cat(
+                        [
+                            visual_token_indexes[keep_visual_global_indices],
+                            non_visual_token_indexes,
+                        ],
+                        dim=0,
+                    )
+                    .sort()
+                    .values
+                )
+
+                hidden_size = inputs_embeds.size(-1)
+                compressed_visual_tokens = compressed_visual_tokens.view(-1, hidden_size)
+                assert visual_token_indexes[keep_visual_global_indices].shape[0] == compressed_visual_tokens.shape[0]
+                inputs_embeds[:, visual_token_indexes[keep_visual_global_indices]] = (
+                    compressed_visual_tokens.unsqueeze(0)
+                )
+                inputs_embeds = inputs_embeds[:, keep_global_indexes]
+                position_ids = position_ids[:, :, keep_global_indexes]
+                if attention_mask is not None:
+                    if isinstance(attention_mask, dict):
+                        attention_mask = {
+                            key: (
+                                value[:, keep_global_indexes]
+                                if value.ndim == 2
+                                else value[:, :, keep_global_indexes][:, :, :, keep_global_indexes]
+                                if value.ndim == 4
+                                else value
+                            )
+                            for key, value in attention_mask.items()
+                        }
+                    elif attention_mask.ndim == 2:
+                        attention_mask = attention_mask[:, keep_global_indexes]
+                    elif attention_mask.ndim == 4:
+                        attention_mask = attention_mask[:, :, keep_global_indexes][:, :, :, keep_global_indexes]
+                if cache_position is not None:
+                    cache_position = cache_position[keep_global_indexes]
+                visual_pos_masks = visual_pos_masks[:, keep_global_indexes]
 
     outputs = self.language_model(
         input_ids=None,
