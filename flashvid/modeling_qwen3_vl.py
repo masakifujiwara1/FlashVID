@@ -524,16 +524,21 @@ def Qwen3VLTextModel_forward(
     # create position embeddings to be shared across the decoder layers
     position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
-    # Obtain FlashVid config
-    if not hasattr(self, "flashvid_config"):
-        raise ValueError("FlashVid configuration is not set in the model.")
-    flashvid_config: FlashVidConfig = getattr(self, "flashvid_config")
+    # Obtain FlashVID config. The monkey patch is class-wide, so Alpamayo's
+    # diffusion expert also reaches this forward even though it is not wrapped
+    # by flashvid(). In that case, keep the normal text-model path.
+    flashvid_config: Optional[FlashVidConfig] = getattr(self, "flashvid_config", None)
     is_prefill = hidden_states.shape[1] > 1
+    enable_inner_pruning = (
+        flashvid_config is not None
+        and visual_pos_masks is not None
+        and flashvid_config.llm_retention_ratio < 1.0
+    )
 
     # decoder layers
     for layer_idx, decoder_layer in enumerate(self.layers):
         # Only prunes visual tokens at prefilling stage.
-        if is_prefill:
+        if is_prefill and enable_inner_pruning:
             if layer_idx == flashvid_config.pruning_layer - 1:
                 kwargs["output_attentions"] = True
             elif layer_idx == flashvid_config.pruning_layer:
